@@ -318,3 +318,109 @@ async function main(): Promise<number> {
 
   // Escalation: after the cut, the next transform sees the aborted turn once and the
   // counter that the cut already bumped is not bumped again.
+  const afterCut = await run("s-live", [user("x"), asst([{ type: "reasoning", text: letMeGo.repeat(60) }], "m-live")])
+  check("the cut turn is not counted a second time by the transform", afterCut.injected, false)
+
+  // ── the same turn, processed twice (a retry) ───────────────────────────────
+  console.log("\n== one turn, one count ==")
+
+  // The identical message array, so the identical assistant message id — exactly what
+  // a retried request hands the transform.
+  const sameTurn = [user("x"), asst([{ type: "text", text: "I need to think about how to proceed here. ".repeat(12) }])]
+  const dup1 = await run("t-dup", sameTurn)
+  const dup2 = await run("t-dup", sameTurn)
+  check("first pass flags the turn", dup1.text.includes("loop 1/3"), true)
+  check("re-processing the same turn is inert", dup2.injected, false)
+
+  // ── escalation across three consecutive looping turns ──────────────────────
+  console.log("\n== escalation ==")
+  const loopMsg: MessagePart = { type: "text", text: "I need to think about how to proceed here. ".repeat(12) }
+  const e1 = await run("t-esc", [user("x"), asst([loopMsg])])
+  const e2 = await run("t-esc", [user("x"), asst([loopMsg])])
+  const e3 = await run("t-esc", [user("x"), asst([loopMsg])])
+  check("turn 1 -> redirect", e1.text.includes("[anti-spiral]") && !e1.text.includes("HALT"), true)
+  check("turn 2 -> redirect", e2.text.includes("loop 2/3"), true)
+  check("turn 3 -> halt", e3.text.includes("HALT"), true)
+
+  // ── v4: the 09-14 spiral — a loop that keeps making tool calls ─────────────
+  console.log("\n== tool-call spiral (2026-09-14) ==")
+  // The shape that ran for 15 minutes: a turn of "Let me act." tics PLUS a tool
+  // call, every 20 seconds. v3 let the tool call reset the escalation counter, so
+  // the session was detected 18 times and halted zero times.
+  const ticTurn = (): ChatMessage[] => [user("x"), asst([
+    { type: "text", text: "Let me act. ".repeat(6) },
+    { type: "tool", tool: "bash", state: { status: "completed" } },
+  ])]
+  const s1 = await run("t-spiral", ticTurn())
+  const s2 = await run("t-spiral", ticTurn())
+  const s3 = await run("t-spiral", ticTurn())
+  check("looping tool turn 1 -> redirect", s1.text.includes("loop 1/3"), true)
+  check("looping tool turn 3 -> halt (v3 never got here)", s3.text.includes("HALT"), true)
+
+  // ── v4: the rate trip — detections that keep getting their counter reset ───
+  console.log("\n== rate trip ==")
+  // Every loop below is followed by a clean turn, which resets the consecutive
+  // counters. v3's spirals survived exactly this way; the rate trip counts
+  // detections in a rolling window instead, so it cannot be reset away.
+  const cleanTurn = (i: number): ChatMessage[] => [user("x"), asst([{ type: "text",
+    text: `The failing import was the stale symlink in dist; removed it and the suite is green (run ${i}).` }])]
+  const rates: string[] = []
+  for (let i = 1; i <= 5; i++) {
+    await run("t-rate", cleanTurn(i))
+    rates.push((await run("t-rate", [user("x"), asst([{ type: "text", text: "Let me act. ".repeat(12) }])])).text)
+  }
+  check("first four detections only redirect", rates.slice(0, 4).every(t => t.includes("[anti-spiral]") && !t.includes("HALT")), true)
+  check("the fifth halts on the rate trip", rates[4].includes("HALT") && rates[4].includes("5 loops detected in the last"), true)
+
+  // ── v4: a short looping turn ───────────────────────────────────────────────
+  console.log("\n== short looping turn ==")
+  // Below the 40-word floor a turn used to be ignored outright, so a nine-word
+  // turn that was 100% repetition scored null.
+  const shortLoop = await run("t-short", [user("x"), asst([{ type: "text", text: "Let me act. Let me act. Let me act." }])])
+  check("a nine-word turn that is pure repetition fires", shortLoop.injected, true)
+  const shortReal = await run("t-short-ok", [user("x"), asst([{ type: "text", text: "The suite is green and the branch is pushed." }])])
+  check("a short ordinary answer stays silent", shortReal.injected, false)
+
+  // ── state written by the previous detector version ─────────────────────────
+  console.log("\n== stale state ==")
+  mkdirSync(STATE_DIR, { recursive: true })
+  writeFileSync(path.join(STATE_DIR, "state.json"),
+    JSON.stringify({ "some-session": { consecutiveSpirals: 7 } })) // v1 schema, frozen
+  const stale = await run("t-stale", [user("x"), asst([{ type: "text", text: "A short normal answer here." }])])
+  check("old frozen counter does not leak in", stale.injected, false)
+
+  // Counters written by an older detector carry different semantics (v3 had no
+  // toolLoops and no rate trip), so a row from that version must not be resumed:
+  // a v3 row already at 2/3 must not turn this session's first loop into a halt.
+  writeFileSync(path.join(STATE_DIR, "state.json"),
+    JSON.stringify({ v: 3, sessions: { "t-v3": { loops: 2, t: Date.now() } } }))
+  const afterV3 = await run("t-v3", [user("x"), asst([{ type: "text", text: "loop. ".repeat(40) }])])
+  check("counters from an older detector version are not resumed", afterV3.text.includes("loop 1/3"), true)
+
+  // ── session rows nobody has touched ────────────────────────────────────────
+  console.log("\n== stale session rows ==")
+  const day = 24 * 60 * 60 * 1000
+  writeFileSync(path.join(STATE_DIR, "state.json"), JSON.stringify({ v: 4, sessions: {
+    "t-long-gone": { loops: 2, t: Date.now() - 40 * day },
+    "t-still-live": { loops: 1, t: Date.now() - 60 * 1000 },
+  } }))
+  await run("t-prune", [user("x"), asst([{ type: "text", text: "loop. ".repeat(40) }])])
+  const pruned = JSON.parse(readFileSync(path.join(STATE_DIR, "state.json"), "utf8")) as {
+    sessions: Record<string, { loops: number }>
+  }
+  check("row idle past the TTL is dropped", "t-long-gone" in pruned.sessions, false)
+  check("recent row survives", pruned.sessions["t-still-live"]?.loops, 1)
+  check("the session just seen is recorded", pruned.sessions["t-prune"]?.loops, 1)
+
+  console.log(`\n${pass} passed, ${fail} failed`)
+  return fail ? 1 : 0
+}
+
+main().then(
+  (code) => { rmSync(STATE_DIR, { recursive: true, force: true }); process.exit(code) },
+  (err: unknown) => {
+    console.error(err)
+    rmSync(STATE_DIR, { recursive: true, force: true })
+    process.exit(1)
+  },
+)
