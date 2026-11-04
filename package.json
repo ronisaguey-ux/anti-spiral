@@ -1,0 +1,18 @@
+{
+  "name": "anti-spiral",
+  "version": "4.0.0",
+  "private": true,
+  "description": "opencode plugin: catches genuine reasoning loops and stops them",
+  "main": "anti-spiral.js",
+  "types": "dist/anti-spiral.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node test/anti-spiral.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  },
+  "license": "MIT"
+}
