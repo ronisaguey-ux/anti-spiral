@@ -318,3 +318,323 @@ function detectTic(lines: string[], minCount: number): SpiralEvidence | null {
   return best
 }
 
+// The live-spiral signature: the END of the text is one unit over and over.
+// Works on raw text (reasoning streams have no code fences worth stripping, and
+// stripping is applied by the caller where it matters).
+export function detectTailLoop(text: string): SpiralEvidence | null {
+  if (!text) return null
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean)
+  // (a) the same short line six or more times in the last 40 lines.
+  const tic = detectTic(lines.slice(-40), 6)
+  if (tic) return { ...tic, coverage: tic.count / Math.min(lines.length, 40) }
+  // (b) short lines with almost no variety: "Let me go." / "Let me read." / "OK."
+  if (lines.length >= TAIL_LINES) {
+    const tail = lines.slice(-TAIL_LINES)
+    const short = tail.every(l => l.split(/\s+/).length <= 8)
+    const distinct = new Set(tail.map(l => l.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim()))
+    // <= 4 distinct values over 12 lines: a 2-, 3- or 4-line cycle repeated three
+    // times or more ("OK. / (Run.) / Let me read. / Let me do it." was a 4-cycle).
+    if (short && distinct.size <= 4) {
+      const counts = new Map<string, number>()
+      for (const l of tail) counts.set(l, (counts.get(l) || 0) + 1)
+      const [phrase, count] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]
+      return { kind: "tail", phrase: phrase.slice(0, 140), count, coverage: count / tail.length }
+    }
+  }
+  // (c) one n-gram dominating the last TAIL_WORDS words.
+  const words = normalizeWords(text)
+  if (words.length < 60) return null
+  const tail = words.slice(-TAIL_WORDS)
+  for (const n of [10, 9, 8, 7, 6, 5, 4, 3, 2]) {
+    const { best, count, coverage } = ngramCoverage(tail, n)
+    if (best !== null && count >= 4 && coverage >= 0.6) {
+      return { kind: "tail", phrase: best, count, coverage }
+    }
+  }
+  return null
+}
+
+// A short turn that is almost entirely one repeated unit. "Let me act." repeated
+// three times is nine words and 100% repetition — far more loop-like than a long
+// message that happens to reuse a phrase — but v3 returned null on it for being
+// under MIN_WORDS, so those turns reset the counter instead of feeding it.
+function detectShortSpiral(text: string, words: string[]): SpiralEvidence | null {
+  if (words.length < MIN_SHORT_WORDS) return null
+  for (const n of [5, 4, 3, 2]) {
+    const { best, count, coverage } = ngramCoverage(words, n)
+    if (best !== null && count >= 3 && coverage >= 0.5) {
+      return { kind: "short", phrase: best, count, coverage }
+    }
+  }
+  return null
+}
+
+// Returns null when the text is not a loop, otherwise the evidence for the redirect.
+export function detectSpiral(rawText: string): SpiralEvidence | null {
+  if (!rawText) return null
+  const text = stripNonProse(rawText)
+  const words = normalizeWords(text)
+  if (words.length < MIN_WORDS) return detectShortSpiral(text, words)
+
+  // 1. The same sentence twice in a row.
+  const sentences = sentencesOf(text)
+  for (let i = 1; i < sentences.length; i++) {
+    const a = sentences[i - 1].toLowerCase().replace(/\s+/g, " ").trim()
+    const b = sentences[i].toLowerCase().replace(/\s+/g, " ").trim()
+    if (a.length > 30 && a === b) {
+      return { kind: "sentence", phrase: sentences[i].slice(0, 140), count: 2 }
+    }
+  }
+
+  // 2. The same line of prose three or more times. Quotations are exempt: a
+  //    summary that restates `user: "..."` three times is quoting, not looping.
+  const allLines = text.split("\n").map(l => l.trim()).filter(Boolean)
+  const lines = allLines.filter(isProseLine).filter(l => !/^["'\u201c]|:\s*["\u201c]/.test(l))
+  const lineCounts = new Map<string, number>()
+  for (const l of lines) {
+    const key = l.toLowerCase().replace(/\s+/g, " ")
+    const c = (lineCounts.get(key) || 0) + 1
+    lineCounts.set(key, c)
+    if (c >= 3) return { kind: "line", phrase: l.slice(0, 140), count: c }
+  }
+
+  // 3. The stall tic: a short line on its own, four or more times.
+  const tic = detectTic(allLines, 4)
+  if (tic) return { ...tic, coverage: tic.count / allLines.length }
+
+  // 4. N-gram dominance over the whole message.
+  for (const n of [8, 7, 6, 5, 4, 3]) {
+    const threshold = n >= 5 ? 0.30 : n === 4 ? 0.40 : 0.55
+    const { best, count, coverage } = ngramCoverage(words, n)
+    if (best !== null && count >= 3 && coverage >= threshold) {
+      return { kind: "phrase", phrase: best, count, coverage }
+    }
+  }
+
+  // 5. The tail has degenerated into a loop even if the whole message has not.
+  return detectTailLoop(text)
+}
+
+// ── state ──────────────────────────────────────────────────────────────────
+
+function loadState(): PluginState {
+  try {
+    const s: unknown = JSON.parse(readFileSync(STATE_FILE, "utf8"))
+    if (!s || typeof s !== "object") return { sessions: {} }
+    // Counters from an older detector mean different things (v3 had no toolLoops
+    // and no rate trip), so they start from zero rather than being resumed.
+    const candidate = s as PluginState
+    if (candidate.v !== STATE_VERSION) return { sessions: {} }
+    return candidate
+  } catch (_) {
+    return { sessions: {} }
+  }
+}
+
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+function pruneSessions(state: PluginState): void {
+  const sessions = state.sessions
+  if (!sessions) return
+  const now = Date.now()
+  for (const [id, row] of Object.entries(sessions)) {
+    if (!row || typeof row !== "object") { delete sessions[id]; continue }
+    const seen = Number.isFinite(row.t) ? row.t : now
+    if (now - seen > SESSION_TTL_MS) delete sessions[id]
+  }
+}
+
+function saveState(state: PluginState): void {
+  try {
+    pruneSessions(state)
+    mkdirSync(STATE_DIR, { recursive: true })
+    writeFileSync(STATE_FILE, JSON.stringify(state), "utf8")
+  } catch (_) {}
+}
+
+function sessionRow(state: PluginState, sessionID: string): SessionRow {
+  if (state.v !== STATE_VERSION) {
+    state.v = STATE_VERSION
+    state.sessions = {}
+  }
+  if (!state.sessions) state.sessions = {}
+  if (!state.sessions[sessionID]) state.sessions[sessionID] = { loops: 0, aborts: 0, toolLoops: 0, hits: [], t: 0 }
+  const s = state.sessions[sessionID]
+  if (!Number.isFinite(s.loops)) s.loops = 0
+  if (!Number.isFinite(s.aborts)) s.aborts = 0
+  // 09-14: consecutive turns that looped WHILE making a tool call. Kept separate
+  // from `loops` because a clean tool-call turn must still reset everything.
+  if (!Number.isFinite(s.toolLoops)) s.toolLoops = 0
+  // Detection timestamps inside RATE_WINDOW_MS. Survives every counter reset: if
+  // the session keeps producing loops at this rate it is spiralling, whatever the
+  // individual counters were talked into.
+  if (!Array.isArray(s.hits)) s.hits = []
+  s.t = Date.now()
+  return s
+}
+
+// Records one detection and says whether the rate trip is now tripped. Hits are
+// never cleared by hand — the rolling window is the only thing that forgets, so a
+// spiral that alternates good turns with bad ones still trips it.
+function recordHit(s: SessionRow, now: number = Date.now()): number {
+  s.hits = (s.hits || []).filter(t => Number.isFinite(t) && now - t < RATE_WINDOW_MS)
+  s.hits.push(now)
+  if (s.hits.length > 200) s.hits = s.hits.slice(-200)
+  return s.hits.length
+}
+
+// ── message helpers ────────────────────────────────────────────────────────
+
+function isToolPart(p: MessagePart | undefined): boolean {
+  if (!p) return false
+  if (p.type === "tool" || p.type === "tool-invocation" || p.type === "tool-call") return true
+  if (p.type === "step-start" && p.tool) return true
+  if (p.tool && p.state) return true
+  return false
+}
+
+function partText(p: MessagePart | undefined): string {
+  if (!p || !["text", "thinking", "reasoning"].includes(p.type ?? "")) return ""
+  return p.text || p.thinking || p.reasoning || p.content || ""
+}
+
+// The last assistant turn: every assistant message back to the preceding user
+// message. `text` is ALL reasoning/text in the turn (a loop that lives in the
+// reasoning of an earlier step is still a loop), `usedTool` is whether any message
+// in the turn carried a tool call, `msgID` identifies the closing message.
+function lastAssistantTurn(messages: ChatMessage[]): TurnSummary {
+  let lastIdx = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.info?.role === "assistant") { lastIdx = i; break }
+  }
+  if (lastIdx < 0) return { text: "", usedTool: false, msgID: "" }
+
+  let usedTool = false
+  const chunks: string[] = []
+  for (let i = lastIdx; i >= 0; i--) {
+    const msg = messages[i]
+    if (!msg?.info) continue
+    if (msg.info.role === "user") break
+    if (msg.info.role !== "assistant") continue
+    const parts = msg.parts || []
+    if (parts.some(isToolPart)) usedTool = true
+    const t = parts.map(partText).filter(Boolean).join("\n")
+    if (t) chunks.unshift(t)
+  }
+  const last = messages[lastIdx]
+  return { text: chunks.join("\n"), usedTool, msgID: (last.info && last.info.id) || "" }
+}
+
+function sessionOf(messages: ChatMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const id = messages[i]?.info?.sessionID
+    if (id) return id
+  }
+  return "default"
+}
+
+// `String(err?.message || err)`, the shape every log line in this file uses.
+function errText(err: unknown): string {
+  const message = (err as { message?: unknown } | null | undefined)?.message
+  return String(message || err)
+}
+
+function uniqueID(prefix: string): string {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+}
+
+function syntheticMsg(text: string, messages: ChatMessage[], sessionID: string): ChatMessage {
+  const lastUser = [...messages].reverse().find(m => m?.info?.role === "user" && m?.info?.model)
+  const agent = lastUser?.info?.agent || "build"
+  const model = lastUser?.info?.model || { providerID: "", modelID: "" }
+  const id = uniqueID("spiral")
+  return {
+    info: { role: "user", id, sessionID, time: { created: Date.now() }, agent, model },
+    parts: [{
+      id: uniqueID("sp"),
+      sessionID, messageID: id,
+      type: "text", text, synthetic: true, ignored: false,
+    }],
+  }
+}
+
+// ── redirect messages ──────────────────────────────────────────────────────
+
+function describe(evidence: SpiralEvidence): string {
+  if (evidence.kind === "short") {
+    const pct = Math.round((evidence.coverage || 0) * 100)
+    return `"${evidence.phrase}" repeated ${evidence.count}x (${pct}% of a short turn)`
+  }
+  if (evidence.kind === "sentence") return `the same sentence twice in a row: "${evidence.phrase}"`
+  if (evidence.kind === "line") return `this line ${evidence.count}x: "${evidence.phrase}"`
+  if (evidence.kind === "tic") return `the line "${evidence.phrase}" on its own ${evidence.count}x — narrating the next step instead of taking it`
+  const pct = Math.round((evidence.coverage || 0) * 100)
+  const where = evidence.kind === "tail" ? " of the end of the message" : " of the message"
+  return `"${evidence.phrase}" repeated ${evidence.count}x (${pct}%${where})`
+}
+
+function redirectMsg(count: number, evidence: SpiralEvidence, tool?: boolean): string {
+  return `[anti-spiral] Repetition detected in your last turn — ${describe(evidence)}.
+
+That is the loop signature: the same unit restated instead of advanced. Nothing here
+forbids continuing the task; it asks you to continue it in a different way.
+
+Do exactly one of these, in this turn:
+  1. Run the next concrete step as a tool call (read the file, run the command, make the edit).
+  2. If the same step has now failed twice, stop repeating it — change the approach, or
+     state the blocker and what you need from the user in one line.
+
+Do not restate the plan. Do not re-explain what you are about to do. Do not write
+"let me" — call the tool. Act.
+
+(loop ${count}/${FREEZE_AFTER} — ${tool
+    ? "a third turn like this one halts narration. Make the call; do not narrate the call."
+    : "three consecutive turns with no tool call and repeated text halt narration."})`
+}
+
+function freezeMsg(count: number, evidence: SpiralEvidence, rate?: number): string {
+  const why = rate && rate >= RATE_LIMIT
+    ? `${rate} loops detected in the last ${Math.round(RATE_WINDOW_MS / 60000)} minutes`
+    : `${count} consecutive turns with repeated text`
+  return `[anti-spiral] HALT — ${why}.
+Last repetition: ${describe(evidence)}.
+
+Narration is paused until real progress happens. Your next turn must be a tool call,
+with no commentary before it. Pick the single most useful one:
+
+  • an unread file that blocks the task   -> Read it
+  • a command whose result you are guessing at -> Bash it
+  • a blocking ambiguity in the request   -> ask the user one direct question, then stop
+
+If you genuinely cannot proceed, say so in one sentence and stop. That is a valid
+outcome — repeating the same reasoning is not.`
+}
+
+function abortMsg(count: number, evidence: SpiralEvidence): string {
+  return `[anti-spiral] Your previous response was cut off mid-stream: it had degenerated into
+a loop — ${describe(evidence)} — and was going nowhere.
+
+Everything before the loop still stands. Resume from there with ONE concrete action:
+the tool call you were about to make (read the file, run the command, make the edit).
+Emit the tool call directly. No "let me", no restating what you are about to do.
+
+If you cannot decide what the next step is, say what is blocking you in one sentence
+and stop.
+
+(mid-stream cut ${count} — repeated cuts without a tool call will halt this session.)`
+}
+
+// ── plugin ─────────────────────────────────────────────────────────────────
+
+export async function AntiSpiral(input: PluginInput): Promise<AntiSpiralPlugin> {
+  const client = input?.client
+  console.log(`[anti-spiral] loaded — loop detector ${VERSION} (mid-stream kill switch + turn review, halt on ${FREEZE_AFTER} straight or ${RATE_LIMIT} in ${Math.round(RATE_WINDOW_MS / 60000)}min)`)
+
+  // Layer 1 bookkeeping. roles: messageID -> role (a user pasting a spiral into the
+  // prompt must never abort their own session — but v3 gated on the role map alone,
+  // and when message.updated never populated it every part was skipped in silence,
+  // which is why a 15-minute spiral produced zero cuts). streams: partID -> last
+  // length judged. cut: messageIDs already aborted. diag: what layer 1 actually saw.
+  const roles = new Map<string, string>()
+  const streams = new Map<string, number>()
+  const cut = new Set<string>()
