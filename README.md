@@ -1,4 +1,4 @@
-# anti-spiral.js
+# anti-spiral
 
 An opencode plugin that catches **genuine reasoning loops** — the same sentence, phrase
 or line restated over and over instead of advanced — and stops them. A loop caught while
@@ -6,8 +6,13 @@ it is still streaming is cut off; a loop found in a finished turn gets a redirec
 evidence. Ordinary technical writing, code, logs and tables are left alone.
 
 ```
-~/.config/opencode/plugins/anti-spiral.js
+~/.config/opencode/plugins/anti-spiral.js    (thin shim)
+~/.config/opencode/plugins/dist/anti-spiral.js
 ```
+
+The plugin is written in TypeScript (`src/anti-spiral.ts`) and compiled to `dist/`. The
+root `anti-spiral.js` is a shim that re-exports the build, so the path an install uses
+does not change.
 
 ## What a loop looks like
 
@@ -146,7 +151,10 @@ noise.
 ## Install
 
 ```bash
+npm install
+npm run build
 cp anti-spiral.js ~/.config/opencode/plugins/
+cp -r dist ~/.config/opencode/plugins/              # the shim requires ./dist
 systemctl --user restart opencode-serve.service     # plugins are cached at serve boot
 ```
 
@@ -159,11 +167,14 @@ journalctl --user -u opencode-serve.service --since "5 min ago" | grep "anti-spi
 ```
 
 The default export must carry the key belonging to the loader that reads the file — `server`
-for the server, which scans `plugins/*.js`:
+for the server, which scans `plugins/*.js`. In `src/anti-spiral.ts`:
 
-```js
+```ts
 export default { id: "anti.spiral", server: AntiSpiral }
 ```
+
+The shim exposes the same shape (`id`, `server`, `default`) to both `require()` and
+`import()`, so a CommonJS copy loads the same way the ES module did.
 
 ## State
 
@@ -202,8 +213,13 @@ thresholds in `detectTic()`.
 ## Tests
 
 ```bash
-node test/anti-spiral.test.mjs
+npm test                          # build + run the suite
+node test/anti-spiral.test.mjs     # after `npm run build`
 ```
+
+The harness is TypeScript in `src/test/anti-spiral.test.ts`, compiled to
+`dist/test/anti-spiral.test.js`; `test/anti-spiral.test.mjs` is a thin shim over it, so the
+command above and the exit code are unchanged.
 
 49 cases driving the real module — the transform hook through synthetic message arrays, and
 the event hook through a streamed sequence of `message.part.updated` events against a fake
@@ -224,7 +240,8 @@ short looping turn** (an 8-word repeat that `MIN_WORDS` used to skip). The stale
 section separately pins that a `v: 3` file is not resumed.
 
 `ANTI_SPIRAL_PLUGIN=/path/to/anti-spiral.js` points the suite at a different copy (useful
-for checking an installed plugin).
+for checking an installed plugin — point it at the installed shim, whose `dist/` must
+exist next to it).
 
 ## Limitations
 
@@ -242,7 +259,21 @@ for checking an installed plugin).
 ## reference/
 
 `reference/anti-spiral.v1.js` is the original detector, kept for comparison. It is **not**
-loaded by anything — do not install it.
+loaded by anything — do not install it, and it was left in JavaScript on purpose (it is a
+frozen historical artefact, not source).
+
+## Source layout
+
+```
+src/anti-spiral.ts              the plugin (TypeScript, strict)
+src/test/anti-spiral.test.ts    the test harness
+anti-spiral.js                  shim -> dist/anti-spiral.js
+test/anti-spiral.test.mjs       shim -> dist/test/anti-spiral.test.js
+dist/                           build output (npm run build)
+```
+
+`npm run typecheck` runs `tsc --noEmit`. The build is `tsc -p tsconfig.json` (CommonJS,
+ES2022, `strict`).
 
 ## Licence
 
