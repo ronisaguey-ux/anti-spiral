@@ -638,3 +638,183 @@ export async function AntiSpiral(input: PluginInput): Promise<AntiSpiralPlugin> 
   const roles = new Map<string, string>()
   const streams = new Map<string, number>()
   const cut = new Set<string>()
+  const bound = <K>(m: Map<K, unknown> | Set<K>, max: number): void => {
+    if (m.size > max) {
+      const first = m.keys().next().value as K
+      m.delete(first)
+    }
+  }
+  const diag: StreamDiag = { seen: 0, finished: 0, reasoning: 0, text: 0, roleKnown: 0, roleUnknown: 0, user: 0, judged: 0, cuts: 0 }
+  function flushDiag(): void {
+    if (diag.seen < 200) return
+    console.log(`[anti-spiral] stream diag — parts=${diag.seen} finished=${diag.finished} reasoning=${diag.reasoning} text=${diag.text} roleKnown=${diag.roleKnown} roleUnknown=${diag.roleUnknown} user=${diag.user} judged=${diag.judged} cuts=${diag.cuts}`)
+    diag.seen = diag.finished = diag.reasoning = diag.text = 0
+    diag.roleKnown = diag.roleUnknown = diag.user = diag.judged = 0
+  }
+
+  async function cutStream(part: MessagePart, evidence: SpiralEvidence): Promise<void> {
+    const sessionID = part.sessionID
+    const messageID = part.messageID
+    if (!sessionID || !messageID || cut.has(messageID)) return
+    cut.add(messageID); bound(cut, 500)
+
+    const state = loadState()
+    const s = sessionRow(state, sessionID)
+    s.aborts += 1
+    s.loops += 1
+    const rate = recordHit(s)
+    s.lastMsg = messageID
+    saveState(state)
+    diag.cuts += 1
+    console.log(`[anti-spiral] MID-STREAM CUT #${s.aborts} rate=${rate}/${RATE_LIMIT} (session=${sessionID}, msg=${messageID}, ${evidence.count}x "${String(evidence.phrase).slice(0, 60)}")`)
+
+    if (!client) return
+    try {
+      await client.session.abort({ path: { id: sessionID } })
+    } catch (err) {
+      console.error("[anti-spiral] abort failed:", errText(err))
+      return
+    }
+    try {
+      await client.tui?.showToast({ body: {
+        title: "anti-spiral", variant: "warning", duration: 6000,
+        message: `Cut a reasoning loop (${evidence.count}x "${String(evidence.phrase).slice(0, 40)}") and redirected.`,
+      } })
+    } catch (_) {}
+    // Give the abort a moment to settle before the redirect opens a new turn.
+    await new Promise<void>(r => setTimeout(r, 400))
+    const halt = s.loops >= FREEZE_AFTER || rate >= RATE_LIMIT
+    const text = halt ? freezeMsg(s.loops, evidence, rate) : abortMsg(s.aborts, evidence)
+    try {
+      await client.session.prompt({ path: { id: sessionID }, body: { parts: [{ type: "text", text }] } })
+    } catch (err) {
+      console.error("[anti-spiral] redirect prompt failed:", errText(err))
+    }
+  }
+
+  return {
+    event: async ({ event }: { event?: PluginEvent }): Promise<void> => {
+      try {
+        if (!event) return
+        if (event.type === "message.updated") {
+          const info = event.properties?.info
+          if (info?.id && info.role) { roles.set(info.id, info.role); bound(roles, 2000) }
+          return
+        }
+        if (event.type !== "message.part.updated") return
+        const part = event.properties?.part
+        if (!part || (part.type !== "reasoning" && part.type !== "text")) return
+        diag.seen += 1
+        if (part.time?.end) { diag.finished += 1; streams.delete(part.id as string); flushDiag(); return } // finished: layer 2 owns it now
+        if (part.type === "reasoning") diag.reasoning += 1; else diag.text += 1
+        const role = roles.get(part.messageID as string)
+        if (role === "assistant") diag.roleKnown += 1
+        else if (role) { diag.user += 1; flushDiag(); return } // a user message: never cut their own turn
+        else diag.roleUnknown += 1
+        if (cut.has(part.messageID as string)) return
+        const text = partText(part)
+        const seen = streams.get(part.id as string)
+        // Reasoning exists only on assistant messages, so it is safe to judge at once.
+        // Text is not: without a role, a long static user paste is indistinguishable
+        // from an assistant stream already in flight. Such a part is judged only after
+        // it is seen to GROW, so its first sighting just records a length to compare
+        // against — a user paste is written once and never grows.
+        if (part.type !== "reasoning" && role !== "assistant" && seen === undefined) {
+          if (text.length) { streams.set(part.id as string, text.length); bound(streams, 500) }
+          flushDiag(); return
+        }
+        if (text.length < STREAM_MIN_CHARS) { flushDiag(); return }
+        if (seen !== undefined && text.length - seen < STREAM_STEP) { flushDiag(); return }
+        streams.set(part.id as string, text.length); bound(streams, 500)
+        diag.judged += 1
+        const evidence = detectTailLoop(stripStreaming(text))
+        if (evidence) await cutStream(part, evidence)
+        flushDiag()
+      } catch (err) {
+        try { console.error("[anti-spiral] event error:", errText(err)) } catch (_) {}
+      }
+    },
+
+    "experimental.chat.messages.transform": async (_hookInput: unknown, output: TransformOutput): Promise<void> => {
+      try {
+        if (!output || !Array.isArray(output.messages)) return
+        const messages = output.messages
+        const sessionID = sessionOf(messages)
+        const state = loadState()
+        const s = sessionRow(state, sessionID)
+
+        const { text, usedTool, msgID } = lastAssistantTurn(messages)
+
+        // This exact turn has already been judged (a retry, or a second request
+        // before the model answered, or a mid-stream cut that already counted it).
+        if (msgID && msgID === s.lastMsg) return
+
+        const evidence = detectSpiral(text)
+
+        if (usedTool) {
+          if (!evidence) {
+            // Genuine work with no loop: escalation resets. A working agent that
+            // makes tool calls must never be frozen — that was the v2 bug.
+            s.loops = 0
+            s.aborts = 0
+            s.toolLoops = 0
+            s.lastMsg = ""
+            saveState(state)
+            return
+          }
+
+          // 09-14: A LOOP *ALONGSIDE* A TOOL CALL USED TO RESET THE COUNTER, so a
+          // spiral that keeps making tool calls could never escalate. Measured live:
+          // a 15-minute "Let me act. / Let me make the call." spiral was detected
+          // 8 times between 02:02 and 02:17 and every single one logged
+          // "redirect, no escalation" — the counter was zeroed by the very tool call
+          // the spiral was producing. A clean tool-call turn still resets (above);
+          // a LOOPING tool-call turn now accumulates in its own counter.
+          s.loops = 0
+          s.aborts = 0
+          s.toolLoops = (s.toolLoops || 0) + 1
+          const rate = recordHit(s)
+          s.lastMsg = msgID
+          saveState(state)
+          // Two ways to halt: three consecutive looping tool-turns, or five drifting
+          // turns in five minutes however many of them got their counter reset.
+          const halt = s.toolLoops >= FREEZE_AFTER || rate >= RATE_LIMIT
+          if (halt) {
+            console.log(`[anti-spiral] TOOL-CALL LOOP #${s.toolLoops} rate=${rate}/${RATE_LIMIT} (session=${sessionID}, ${evidence.kind}) — halting`)
+            messages.push(syntheticMsg(freezeMsg(s.toolLoops, evidence, rate), messages, sessionID))
+          } else {
+            console.log(`[anti-spiral] loop alongside a tool call #${s.toolLoops}/${FREEZE_AFTER} rate=${rate}/${RATE_LIMIT} (session=${sessionID}, ${evidence.kind}) — redirect`)
+            messages.push(syntheticMsg(redirectMsg(s.toolLoops, evidence, true), messages, sessionID))
+          }
+          return
+        }
+        // a non-tool turn that is NOT looping also clears the consecutive tool-call
+        // counter. It deliberately does NOT clear the rate-trip hits: one clean turn
+        // between two loops is exactly how v3's spirals survived. Hits expire only
+        // by falling out of the rolling window, which is what makes the trip
+        // un-forgettable.
+        if (!evidence && s.toolLoops) s.toolLoops = 0
+
+        if (evidence) {
+          s.loops++
+          const rate = recordHit(s)
+          s.lastMsg = msgID
+          saveState(state)
+          const halt = s.loops >= FREEZE_AFTER || rate >= RATE_LIMIT
+          console.log(`[anti-spiral] loop #${s.loops} rate=${rate}/${RATE_LIMIT} (session=${sessionID}, ${evidence.kind})${halt ? " — halting" : ""}`)
+          const msg = halt ? freezeMsg(s.loops, evidence, rate) : redirectMsg(s.loops, evidence)
+          messages.push(syntheticMsg(msg, messages, sessionID))
+        } else if (s.loops > 0 || s.aborts > 0) {
+          s.loops = 0
+          s.aborts = 0
+          s.lastMsg = ""
+          saveState(state)
+        }
+      } catch (err) {
+        try { console.error("[anti-spiral] error:", errText(err)) } catch (_) {}
+      }
+    },
+  }
+}
+
+export default { id: "anti.spiral", server: AntiSpiral }
